@@ -1,0 +1,102 @@
+package auto
+
+import (
+	"bufio"
+	"context"
+	"net"
+	"time"
+
+	"github.com/wenewzhang/core/handler"
+	"github.com/wenewzhang/core/logger"
+	md "github.com/wenewzhang/core/metadata"
+	"github.com/go-gost/gosocks5"
+	netpkg "github.com/wenewzhang/x/internal/net"
+	"github.com/wenewzhang/x/registry"
+)
+
+func init() {
+	registry.HandlerRegistry().Register("auto", NewHandler)
+}
+
+type autoHandler struct {
+	httpHandler   handler.Handler
+	socks5Handler handler.Handler
+	options       handler.Options
+}
+
+func NewHandler(opts ...handler.Option) handler.Handler {
+	options := handler.Options{}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	h := &autoHandler{
+		options: options,
+	}
+
+	if f := registry.HandlerRegistry().Get("http"); f != nil {
+		v := append(opts,
+			handler.LoggerOption(options.Logger.WithFields(map[string]any{"handler": "http"})))
+		h.httpHandler = f(v...)
+	}
+	if f := registry.HandlerRegistry().Get("socks5"); f != nil {
+		v := append(opts,
+			handler.LoggerOption(options.Logger.WithFields(map[string]any{"handler": "socks5"})))
+		h.socks5Handler = f(v...)
+	}
+
+	return h
+}
+
+func (h *autoHandler) Init(md md.Metadata) error {
+	if h.httpHandler != nil {
+		if err := h.httpHandler.Init(md); err != nil {
+			return err
+		}
+	}
+	if h.socks5Handler != nil {
+		if err := h.socks5Handler.Init(md); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (h *autoHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler.HandleOption) error {
+	log := h.options.Logger.WithFields(map[string]any{
+		"remote": conn.RemoteAddr().String(),
+		"local":  conn.LocalAddr().String(),
+	})
+
+	if log.IsLevelEnabled(logger.DebugLevel) {
+		start := time.Now()
+		log.Debugf("%s <> %s", conn.RemoteAddr(), conn.LocalAddr())
+		defer func() {
+			log.WithFields(map[string]any{
+				"duration": time.Since(start),
+			}).Debugf("%s >< %s", conn.RemoteAddr(), conn.LocalAddr())
+		}()
+	}
+
+	br := bufio.NewReader(conn)
+	b, err := br.Peek(1)
+	if err != nil {
+		log.Error(err)
+		conn.Close()
+		return err
+	}
+
+	conn = netpkg.NewBufferReaderConn(conn, br)
+	switch b[0] {
+	case gosocks5.Ver5: // socks5
+		if h.socks5Handler != nil {
+			return h.socks5Handler.Handle(ctx, conn)
+		}
+	default: // http
+		if h.httpHandler != nil {
+			return h.httpHandler.Handle(ctx, conn)
+		}
+	}
+	return nil
+}
